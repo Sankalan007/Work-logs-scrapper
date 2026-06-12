@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"google.golang.org/genai"
 )
 
-// GenerateWorkLogs takes a user's name, email, and list of commits, and generates a 3-6 pointer work log using Gemini.
-func GenerateWorkLogs(ctx context.Context, apiKey, modelName, userName, userEmail string, commits []GitLabCommit) (string, error) {
+// GenerateWorkLogs takes a user's name, email, list of commits, and duration bounds to generate a dynamic-length work log.
+func GenerateWorkLogs(ctx context.Context, apiKey, modelName, userName, userEmail string, commits []GitLabCommit, since, until time.Time) (string, error) {
 	if len(commits) == 0 {
 		return "No commits found in the specified duration.", nil
 	}
@@ -41,9 +42,31 @@ func GenerateWorkLogs(ctx context.Context, apiKey, modelName, userName, userEmai
 		sb.WriteString(fmt.Sprintf("- %s: %s\n", c.CommittedDate.Format("2006-01-02"), msg))
 	}
 
+	// Calculate target bullet points based on the duration (in days)
+	days := int(until.Sub(since).Hours() / 24)
+	if days < 1 {
+		days = 1
+	}
+
+	var pointerRange string
+	switch {
+	case days <= 1:
+		pointerRange = "1-3"
+	case days <= 4:
+		pointerRange = "2-5"
+	case days <= 9:
+		pointerRange = "3-6"
+	case days <= 35:
+		pointerRange = "4-8"
+	case days <= 100:
+		pointerRange = "5-10"
+	default:
+		pointerRange = "6-12"
+	}
+
 	prompt := fmt.Sprintf("Analyze the following GitLab commit messages for user %s (%s) and generate the work log:\n\n%s", userName, userEmail, sb.String())
 
-	systemInstruction := "You are an expert developer and project manager. Your job is to analyze a developer's raw commit messages and extract a clean, concise, 3-6 pointer professional work log summarizing their achievements. Focus on technical and business value. Ignore minor/trivial commits like typo fixes, dependency updates, or automated tasks. Output ONLY markdown bullet points using '*' as the bullet symbol. Do NOT include any introductory or concluding text."
+	systemInstruction := fmt.Sprintf("You are an expert developer and project manager. Your job is to analyze a developer's raw commit messages and extract a clean, concise, %s pointer professional work log summarizing their achievements. Focus on technical and business value. Ignore minor/trivial commits like typo fixes, dependency updates, or automated tasks. Output ONLY markdown bullet points using '*' as the bullet symbol. Do NOT include any introductory or concluding text.", pointerRange)
 
 	// Call the model
 	resp, err := client.Models.GenerateContent(ctx, modelName, genai.Text(prompt), &genai.GenerateContentConfig{

@@ -237,7 +237,7 @@ func main() {
 	}
 
 	fmt.Printf("%s[4/4] Summarizing work log using %s...%s\n", colorCyan, modelName, colorReset)
-	summary, err := GenerateWorkLogs(context.Background(), geminiAPIKey, modelName, glUser.Name, filterEmail, gatheredCommits)
+	summary, err := GenerateWorkLogs(context.Background(), geminiAPIKey, modelName, glUser.Name, filterEmail, gatheredCommits, since, until)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%sError generating work log: %v%s\n", colorRed, err, colorReset)
 		os.Exit(1)

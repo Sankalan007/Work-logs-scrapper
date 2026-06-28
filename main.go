@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // ANSI colors for premium terminal UI
@@ -32,12 +33,17 @@ func main() {
 	flagInstance := flag.String("instance", "", "GitLab instance URL (defaults to https://gitlab.com)")
 	flagToken := flag.String("token", "", "GitLab Personal Access Token")
 	flagAPIKey := flag.String("api-key", "", "Google GenAI API Key (or set GEMINI_API_KEY env var)")
-	flagDuration := flag.String("duration", "7d", "Duration for work logs (1d, 3d, 7d, 1m, 3m, 12m or YYYY-MM-DD[:YYYY-MM-DD])")
+	flagDuration := flag.String("duration", "1d", "Duration for work logs (1d, 3d, 7d, 1m, 3m, 12m or YYYY-MM-DD[:YYYY-MM-DD])")
 	flagProjects := flag.String("projects", "", "Comma-separated list of specific project IDs or paths (restricts scraping)")
 	flagEmail := flag.String("email", "", "Override email to filter commits (defaults to autodetected user email)")
 	flagModel := flag.String("model", "gemini-2.5-flash", "Gemini model to use")
 	flagSave := flag.Bool("save", false, "Save provided instance, token, and API key to ~/.gitlab-worklogs.json and exit")
 	flagDryRun := flag.Bool("dry-run", false, "Dry run: print commits fetched from GitLab without calling Gemini")
+	flagSheet := flag.String("sheet", "", "Google Sheets URL (or ID) to auto-fill, one row per date of the current month up to today")
+	flagDateCol := flag.String("date-col", "Date", "Header name of the date column to read in the sheet")
+	flagLogCol := flag.String("log-col", "", "Header name of the column to fill with generated work logs in the sheet")
+	flagGoogleCreds := flag.String("google-creds", defaultGoogleCredsPath(), "Path to Google OAuth client-credentials JSON (Desktop app)")
+	flagOverall := flag.Bool("overall", false, "Produce a single aggregate summary instead of a per-date breakdown")
 
 	// Custom usage text
 	flag.Usage = func() {
@@ -50,8 +56,10 @@ func main() {
 		fmt.Println("\nExamples:")
 		fmt.Println("  # First-time setup:")
 		fmt.Println("  gitlab-worklogs -save -instance https://gitlab.com -token glpat-XXX -api-key AIzaSyXXX")
-		fmt.Println("\n  # Generate work log for last 7 days (default):")
+		fmt.Println("\n  # Generate work log for last 1 day (default):")
 		fmt.Println("  gitlab-worklogs")
+		fmt.Println("\n  # Auto-fill a Google Sheet (one row per date this month, up to today):")
+		fmt.Println("  gitlab-worklogs -sheet https://docs.google.com/spreadsheets/d/<ID>/edit -date-col Date -log-col \"Work Log\"")
 		fmt.Println("\n  # Generate work log for a custom date range:")
 		fmt.Println("  gitlab-worklogs -duration 2026-06-01:2026-06-05")
 		fmt.Println("\n  # Dry run to see commits fetched:")
@@ -93,10 +101,24 @@ func main() {
 	}
 
 	// 6. Resolve Time Window
-	since, until, err := ResolveDateRange(*flagDuration)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%sError resolving duration: %v%s\n", colorRed, err, colorReset)
-		os.Exit(1)
+	sheetMode := *flagSheet != ""
+	var since, until time.Time
+	if sheetMode {
+		// Sheet mode ignores -duration: scan from the 1st of the current month through now.
+		if *flagLogCol == "" {
+			fmt.Fprintf(os.Stderr, "%sError: -log-col is required when using -sheet.%s\n", colorRed, colorReset)
+			os.Exit(1)
+		}
+		now := time.Now()
+		since = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+		until = now
+	} else {
+		var derr error
+		since, until, derr = ResolveDateRange(*flagDuration)
+		if derr != nil {
+			fmt.Fprintf(os.Stderr, "%sError resolving duration: %v%s\n", colorRed, derr, colorReset)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Printf("%s[1/4] Connecting to GitLab instance %s...%s\n", colorCyan, instanceURL, colorReset)
@@ -209,8 +231,29 @@ func main() {
 	fmt.Printf("  Processed %d total raw commits, filtered down to %s%d%s relevant developer commits.\n",
 		processedCommitsCount, colorBold, len(gatheredCommits), colorReset)
 
-	if len(gatheredCommits) == 0 {
-		fmt.Printf("\n%sNo commit activities found in the selected time range.%s\n", colorYellow, colorReset)
+	// 8.5 Fetch merge-request activity (assignee / reviewer / comments) in the window.
+	fmt.Printf("%s  Fetching merge request activity...%s", colorDim, colorReset)
+	mrInvolvements, err := glClient.GetMRInvolvement(glUser.ID, glUser.Username, since, until)
+	if err != nil {
+		fmt.Printf(" %s[failed: %v]%s\n", colorYellow, err, colorReset)
+		mrInvolvements = nil
+	} else {
+		fmt.Printf(" %sfound %d MR(s)%s\n", colorGreen, len(mrInvolvements), colorReset)
+	}
+
+	if len(gatheredCommits) == 0 && len(mrInvolvements) == 0 {
+		fmt.Printf("\n%sNo commit or merge request activity found in the selected time range.%s\n", colorYellow, colorReset)
+		return
+	}
+
+	// 8.6 Sheet mode: fill one row per date of the current month (up to today).
+	if sheetMode {
+		if geminiAPIKey == "" {
+			fmt.Fprintf(os.Stderr, "\n%sError: Gemini API key is missing.%s\n", colorRed, colorReset)
+			os.Exit(1)
+		}
+		runSheetFill(geminiAPIKey, modelName, glUser.Name, filterEmail, gatheredCommits, mrInvolvements,
+			*flagGoogleCreds, *flagSheet, *flagDateCol, *flagLogCol)
 		return
 	}
 
@@ -226,6 +269,11 @@ func main() {
 				break
 			}
 		}
+		fmt.Printf("\n%s--- Dry Run: MR Activity ---%s\n", colorYellow, colorReset)
+		for _, mr := range mrInvolvements {
+			fmt.Printf("MR %d:%s | assignee=%v reviewer=%v comments=%d\n",
+				mr.IID, mr.Title, mr.IsAssignee, mr.IsReviewer, len(mr.Comments))
+		}
 		return
 	}
 
@@ -237,7 +285,8 @@ func main() {
 	}
 
 	fmt.Printf("%s[4/4] Summarizing work log using %s...%s\n", colorCyan, modelName, colorReset)
-	summary, err := GenerateWorkLogs(context.Background(), geminiAPIKey, modelName, glUser.Name, filterEmail, gatheredCommits, since, until)
+	summary, err := GenerateWorkLogs(context.Background(), geminiAPIKey, modelName, glUser.Name, filterEmail,
+		gatheredCommits, mrInvolvements, since, until, !*flagOverall)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%sError generating work log: %v%s\n", colorRed, err, colorReset)
 		os.Exit(1)
@@ -247,6 +296,99 @@ func main() {
 	fmt.Printf("\n%s=== Synthesized Work Log ===%s\n\n", colorBold+colorGreen, colorReset)
 	fmt.Println(summary)
 	fmt.Println()
+}
+
+// runSheetFill buckets commits and MR activity by day and writes a per-day work log into
+// the named sheet column for every row whose date falls in the current month, up to today.
+func runSheetFill(apiKey, modelName, userName, filterEmail string, commits []GitLabCommit, mrs []MRInvolvement,
+	credsPath, sheetLink, dateCol, logCol string) {
+
+	// Bucket commits by their local committed date (YYYY-MM-DD).
+	buckets := make(map[string][]GitLabCommit)
+	for _, c := range commits {
+		key := c.CommittedDate.Local().Format("2006-01-02")
+		buckets[key] = append(buckets[key], c)
+	}
+
+	// Bucket MR involvement by day: comment-bearing MRs land on each comment's date;
+	// assignee/reviewer-only MRs land on their last-updated date.
+	mrBuckets := make(map[string][]MRInvolvement)
+	for _, mr := range mrs {
+		if len(mr.Comments) == 0 {
+			key := mr.LastDate.Local().Format("2006-01-02")
+			mrBuckets[key] = append(mrBuckets[key], mr)
+			continue
+		}
+		perDay := make(map[string][]MRComment)
+		for _, cm := range mr.Comments {
+			key := cm.Date.Local().Format("2006-01-02")
+			perDay[key] = append(perDay[key], cm)
+		}
+		for key, cms := range perDay {
+			day := mr
+			day.Comments = cms
+			mrBuckets[key] = append(mrBuckets[key], day)
+		}
+	}
+
+	now := time.Now()
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
+	ctx := context.Background()
+
+	fmt.Printf("%s[Sheet] Authorizing with Google...%s\n", colorCyan, colorReset)
+	sc, err := NewSheetClient(ctx, credsPath, sheetLink)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%sFailed to open Google Sheet: %v%s\n", colorRed, err, colorReset)
+		os.Exit(1)
+	}
+
+	fmt.Printf("%s[Sheet] Reading date column %q...%s\n", colorCyan, dateCol, colorReset)
+	rows, logColIdx, err := sc.ReadDateColumn(dateCol, logCol)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%sFailed to read sheet: %v%s\n", colorRed, err, colorReset)
+		os.Exit(1)
+	}
+
+	written, skipped := 0, 0
+	for _, r := range rows {
+		d := time.Date(r.Date.Year(), r.Date.Month(), r.Date.Day(), 0, 0, 0, 0, now.Location())
+
+		// Only fill dates in the current month, up to and including today.
+		if d.Before(monthStart) || d.After(today) {
+			continue
+		}
+
+		dayKey := d.Format("2006-01-02")
+		dayCommits := buckets[dayKey]
+		dayMRs := mrBuckets[dayKey]
+		if len(dayCommits) == 0 && len(dayMRs) == 0 {
+			fmt.Printf("  %s%s: no activity, skipping%s\n", colorDim, dayKey, colorReset)
+			skipped++
+			continue
+		}
+
+		dayStart := d
+		dayEnd := time.Date(d.Year(), d.Month(), d.Day(), 23, 59, 59, 0, now.Location())
+		summary, err := GenerateWorkLogs(ctx, apiKey, modelName, userName, filterEmail,
+			dayCommits, dayMRs, dayStart, dayEnd, false)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  %s%s: generation failed: %v%s\n", colorYellow, dayKey, err, colorReset)
+			skipped++
+			continue
+		}
+
+		if err := sc.WriteLog(r.RowNumber, logColIdx, summary); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s%s: write failed: %v%s\n", colorYellow, dayKey, err, colorReset)
+			skipped++
+			continue
+		}
+		fmt.Printf("  %s%s%s -> row %d (%d commit(s), %d MR(s))\n", colorGreen, dayKey, colorReset, r.RowNumber, len(dayCommits), len(dayMRs))
+		written++
+	}
+
+	fmt.Printf("\n%sDone. Wrote %d row(s), skipped %d.%s\n", colorBold+colorGreen, written, skipped, colorReset)
 }
 
 // Helpers

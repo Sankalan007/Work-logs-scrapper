@@ -22,10 +22,10 @@ type GitLabUser struct {
 
 // GitLabProject represents a simplified GitLab project structure.
 type GitLabProject struct {
-	ID             int       `json:"id"`
-	Name           string    `json:"name"`
-	PathWithNamespace string `json:"path_with_namespace"`
-	LastActivityAt time.Time `json:"last_activity_at"`
+	ID                int       `json:"id"`
+	Name              string    `json:"name"`
+	PathWithNamespace string    `json:"path_with_namespace"`
+	LastActivityAt    time.Time `json:"last_activity_at"`
 }
 
 // GitLabCommit represents a commit from the GitLab repository commits API.
@@ -248,6 +248,255 @@ func (c *GitLabClient) GetProjectCommits(projectID int, since, until time.Time, 
 	}
 
 	return allCommits, nil
+}
+
+// GitLabMR represents a merge request from the GitLab API.
+type GitLabMR struct {
+	IID        int          `json:"iid"`
+	ProjectID  int          `json:"project_id"`
+	Title      string       `json:"title"`
+	WebURL     string       `json:"web_url"`
+	State      string       `json:"state"`
+	UpdatedAt  time.Time    `json:"updated_at"`
+	Author     GitLabUser   `json:"author"`
+	Assignees  []GitLabUser `json:"assignees"`
+	Reviewers  []GitLabUser `json:"reviewers"`
+	References struct {
+		Full string `json:"full"`
+	} `json:"references"`
+}
+
+// MRComment is a single comment the user left on a merge request.
+type MRComment struct {
+	Date time.Time
+	Body string
+}
+
+// MRInvolvement captures how the user engaged with a single merge request.
+type MRInvolvement struct {
+	IID        int
+	Title      string
+	Ref        string // e.g. "group/project!123" (falls back to web URL)
+	IsAssignee bool
+	IsReviewer bool
+	Comments   []MRComment
+	LastDate   time.Time // attribution date when there are no comments
+}
+
+// containsUserID reports whether the given user ID is present in the list.
+func containsUserID(users []GitLabUser, id int) bool {
+	for _, u := range users {
+		if u.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// ListMergeRequests returns merge requests filtered by a username field
+// (filterKey is "assignee_username" or "reviewer_username") updated within the window.
+func (c *GitLabClient) ListMergeRequests(filterKey, username string, since, until time.Time) ([]GitLabMR, error) {
+	var all []GitLabMR
+	page := 1
+	perPage := 100
+
+	for {
+		params := url.Values{}
+		params.Set("scope", "all")
+		params.Set(filterKey, username)
+		params.Set("updated_after", since.Format(time.RFC3339))
+		params.Set("updated_before", until.Format(time.RFC3339))
+		params.Set("order_by", "updated_at")
+		params.Set("sort", "desc")
+		params.Set("per_page", strconv.Itoa(perPage))
+		params.Set("page", strconv.Itoa(page))
+
+		body, header, err := c.executeRequest("GET", "merge_requests", params)
+		if err != nil {
+			return nil, err
+		}
+
+		var mrs []GitLabMR
+		if err := json.Unmarshal(body, &mrs); err != nil {
+			return nil, err
+		}
+		if len(mrs) == 0 {
+			break
+		}
+		all = append(all, mrs...)
+
+		nextPageStr := header.Get("X-Next-Page")
+		if nextPageStr == "" {
+			break
+		}
+		nextPage, err := strconv.Atoi(nextPageStr)
+		if err != nil || nextPage == 0 {
+			break
+		}
+		page = nextPage
+	}
+	return all, nil
+}
+
+// GetMergeRequest fetches a single merge request's detail.
+func (c *GitLabClient) GetMergeRequest(projectID, iid int) (*GitLabMR, error) {
+	path := fmt.Sprintf("projects/%d/merge_requests/%d", projectID, iid)
+	body, _, err := c.executeRequest("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var mr GitLabMR
+	if err := json.Unmarshal(body, &mr); err != nil {
+		return nil, err
+	}
+	return &mr, nil
+}
+
+// mrCommentEvent is a comment the user made on a merge request, from the events API.
+type mrCommentEvent struct {
+	ProjectID int
+	IID       int
+	Date      time.Time
+	Body      string
+}
+
+// gitlabEvent mirrors the relevant fields of a GitLab event object.
+type gitlabEvent struct {
+	ActionName string    `json:"action_name"`
+	CreatedAt  time.Time `json:"created_at"`
+	ProjectID  int       `json:"project_id"`
+	Note       *struct {
+		Body         string `json:"body"`
+		NoteableType string `json:"noteable_type"`
+		NoteableIID  int    `json:"noteable_iid"`
+	} `json:"note"`
+}
+
+// GetMyMRCommentEvents returns the authenticated user's MR comments within the window.
+func (c *GitLabClient) GetMyMRCommentEvents(since, until time.Time) ([]mrCommentEvent, error) {
+	var out []mrCommentEvent
+	page := 1
+	perPage := 100
+
+	for {
+		params := url.Values{}
+		params.Set("action", "commented")
+		// `after`/`before` are date-only and exclusive; widen by a day and filter precisely below.
+		params.Set("after", since.AddDate(0, 0, -1).Format("2006-01-02"))
+		params.Set("before", until.AddDate(0, 0, 1).Format("2006-01-02"))
+		params.Set("per_page", strconv.Itoa(perPage))
+		params.Set("page", strconv.Itoa(page))
+
+		body, header, err := c.executeRequest("GET", "events", params)
+		if err != nil {
+			return nil, err
+		}
+
+		var events []gitlabEvent
+		if err := json.Unmarshal(body, &events); err != nil {
+			return nil, err
+		}
+		if len(events) == 0 {
+			break
+		}
+
+		for _, ev := range events {
+			if ev.Note == nil || ev.Note.NoteableType != "MergeRequest" {
+				continue
+			}
+			if ev.CreatedAt.Before(since) || ev.CreatedAt.After(until) {
+				continue
+			}
+			out = append(out, mrCommentEvent{
+				ProjectID: ev.ProjectID,
+				IID:       ev.Note.NoteableIID,
+				Date:      ev.CreatedAt,
+				Body:      ev.Note.Body,
+			})
+		}
+
+		nextPageStr := header.Get("X-Next-Page")
+		if nextPageStr == "" {
+			break
+		}
+		nextPage, err := strconv.Atoi(nextPageStr)
+		if err != nil || nextPage == 0 {
+			break
+		}
+		page = nextPage
+	}
+	return out, nil
+}
+
+// GetMRInvolvement assembles all merge requests the user engaged with in the window:
+// MRs they are assignee/reviewer of (updated in window) plus MRs they commented on.
+func (c *GitLabClient) GetMRInvolvement(userID int, username string, since, until time.Time) ([]MRInvolvement, error) {
+	records := make(map[string]*MRInvolvement)
+	key := func(projectID, iid int) string { return fmt.Sprintf("%d/%d", projectID, iid) }
+
+	apply := func(mr GitLabMR) *MRInvolvement {
+		// Authoring an MR is "my own work" (captured via commits); never treat the
+		// author as a tester/reviewer of their own MR, even if they commented.
+		if mr.Author.ID == userID {
+			return nil
+		}
+		k := key(mr.ProjectID, mr.IID)
+		rec := records[k]
+		if rec == nil {
+			ref := mr.References.Full
+			if ref == "" {
+				ref = mr.WebURL
+			}
+			rec = &MRInvolvement{IID: mr.IID, Title: mr.Title, Ref: ref, LastDate: mr.UpdatedAt}
+			records[k] = rec
+		}
+		rec.IsAssignee = rec.IsAssignee || containsUserID(mr.Assignees, userID)
+		rec.IsReviewer = rec.IsReviewer || containsUserID(mr.Reviewers, userID)
+		return rec
+	}
+
+	assigned, err := c.ListMergeRequests("assignee_username", username, since, until)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list assigned MRs: %w", err)
+	}
+	for _, mr := range assigned {
+		apply(mr)
+	}
+
+	reviewing, err := c.ListMergeRequests("reviewer_username", username, since, until)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list reviewer MRs: %w", err)
+	}
+	for _, mr := range reviewing {
+		apply(mr)
+	}
+
+	comments, err := c.GetMyMRCommentEvents(since, until)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list MR comment events: %w", err)
+	}
+	for _, cm := range comments {
+		k := key(cm.ProjectID, cm.IID)
+		rec := records[k]
+		if rec == nil {
+			// MR not seen via assignee/reviewer lists: fetch detail to resolve title and roles.
+			detail, derr := c.GetMergeRequest(cm.ProjectID, cm.IID)
+			if derr != nil {
+				continue // skip MRs we cannot resolve
+			}
+			rec = apply(*detail)
+			if rec == nil {
+				continue // I authored this MR; my work is captured via commits
+			}
+		}
+		rec.Comments = append(rec.Comments, MRComment{Date: cm.Date, Body: cm.Body})
+	}
+
+	out := make([]MRInvolvement, 0, len(records))
+	for _, rec := range records {
+		out = append(out, *rec)
+	}
+	return out, nil
 }
 
 // ResolveDateRange converts a duration string into start and end time.Time.

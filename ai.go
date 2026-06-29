@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -9,6 +10,10 @@ import (
 
 	"google.golang.org/genai"
 )
+
+// fallbackModels are tried in order when the primary model returns HTTP 429
+// (rate limit / quota exhausted). The primary model is prepended at call time.
+var fallbackModels = []string{"gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"}
 
 // GenerateWorkLogs synthesizes a work log from commits and merge-request activity.
 // When perDay is true the output is grouped under per-date headers; otherwise it is
@@ -37,19 +42,32 @@ func GenerateWorkLogs(ctx context.Context, apiKey, modelName, userName, userEmai
 	prompt := buildActivityContext(userName, userEmail, commits, mrs)
 	systemInstruction := buildSystemInstruction(perDay)
 
-	resp, err := client.Models.GenerateContent(ctx, modelName, genai.Text(prompt), &genai.GenerateContentConfig{
+	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: genai.NewContentFromText(systemInstruction, ""),
 		Temperature:       genai.Ptr[float32](0.2),
-	})
-	if err != nil {
-		return "", fmt.Errorf("Gemini API call failed: %w", err)
 	}
 
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("no response candidates returned by Gemini")
+	// Try the chosen model first, then fall back to others on 429 (rate limit).
+	models := append([]string{modelName}, fallbackModels...)
+	var lastErr error
+	for _, m := range models {
+		resp, err := client.Models.GenerateContent(ctx, m, genai.Text(prompt), cfg)
+		if err != nil {
+			lastErr = err
+			var apiErr genai.APIError
+			if errors.As(err, &apiErr) && apiErr.Code == 429 {
+				continue // rate limited — try next model
+			}
+			return "", fmt.Errorf("Gemini API call failed: %w", err)
+		}
+		if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+			lastErr = fmt.Errorf("no response candidates returned by Gemini")
+			continue
+		}
+		return strings.TrimSpace(resp.Candidates[0].Content.Parts[0].Text), nil
 	}
 
-	return strings.TrimSpace(resp.Candidates[0].Content.Parts[0].Text), nil
+	return "", fmt.Errorf("all models exhausted (last error: %w)", lastErr)
 }
 
 // buildActivityContext renders commits and MR engagement (with dates) into the prompt body.
@@ -122,6 +140,9 @@ func buildSystemInstruction(perDay bool) string {
 	b.WriteString("COMMIT RULES — these are the developer's own authored work. Summarize concrete achievements ")
 	b.WriteString("as their own work-log items using active authoring verbs like \"Worked on\", \"Implemented\", \"Fixed\", \"Refactored\", \"Added\". ")
 	b.WriteString("Never describe the developer's own commits/MRs as tested or reviewed.\n\n")
+
+	b.WriteString("LIMIT — the 5-item-per-day cap applies ONLY to commit-authored items: emit at most 5 of those per day, merging/summarizing related commits if there are more. ")
+	b.WriteString("ALWAYS list EVERY merge-request engagement line (Tested / Reviewed / Re-tested / Tested and reviewed) in full — never drop, merge, or summarize MR lines, even if the day's total then exceeds 5.\n\n")
 
 	b.WriteString("OUTPUT FORMAT — a NUMBERED markdown list, one achievement per line, like:\n")
 	b.WriteString("1. Fixed and resolved maintenance page comments\n")
